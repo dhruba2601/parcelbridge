@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: parcelbridge-api
+    runtime: node
+    plan: starter
+    rootDir: backend
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: STORAGE_DRIVER
+        value: supabase
+      - key: DEMO_MODE
+        value: "false"
+      - key: PORT
+        value: "4000"
+      - key: FRONTEND_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: QR_HMAC_SECRET
+        generateValue: true
+      - key: OTP_HMAC_SECRET
+        generateValue: true
+      - key: WEBHOOK_SHARED_SECRET
+        generateValue: true
