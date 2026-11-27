@@ -97,19 +97,20 @@ GRANT EXECUTE ON FUNCTION public.is_society_staff_of(UUID) TO authenticated, ser
 GRANT EXECUTE ON FUNCTION public.is_driver_assigned_to_parcel(UUID) TO authenticated, service_role;
 
 -- ============================================================================
--- 2. Defense-in-Depth Triggers (SECURITY INVOKER)
+-- 2. Defense-in-Depth Triggers (SECURITY INVOKER, Genuine JSONB Allowlists)
 -- ============================================================================
 
 -- 2.1 Profile Complete Allowlist:
--- Ordinary users may ONLY update: full_name, phone, flat_number, avatar_url (+ updated_at).
--- All other columns (id, auth_user_id, email, password_hash, role_code, society_id, unit_id,
--- is_active, is_demo, created_at) are locked unless caller is service_role, SQL Editor, or super_admin.
+-- Ordinary users may ONLY modify: full_name, phone, flat_number, avatar_url, updated_at.
+-- Every other column (including any future columns) is rejected via JSONB diff.
 CREATE OR REPLACE FUNCTION public.prevent_profile_privilege_escalation()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY INVOKER
 SET search_path = public, pg_temp
 AS $$
+DECLARE
+  v_allowed CONSTANT TEXT[] := ARRAY['full_name', 'phone', 'flat_number', 'avatar_url', 'updated_at'];
 BEGIN
   IF auth.role() = 'service_role' OR current_user = 'service_role' THEN
     RETURN NEW;
@@ -125,17 +126,8 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  IF NEW.id IS DISTINCT FROM OLD.id
-     OR NEW.auth_user_id IS DISTINCT FROM OLD.auth_user_id
-     OR NEW.email IS DISTINCT FROM OLD.email
-     OR NEW.password_hash IS DISTINCT FROM OLD.password_hash
-     OR NEW.role_code IS DISTINCT FROM OLD.role_code
-     OR NEW.society_id IS DISTINCT FROM OLD.society_id
-     OR NEW.unit_id IS DISTINCT FROM OLD.unit_id
-     OR NEW.is_active IS DISTINCT FROM OLD.is_active
-     OR NEW.is_demo IS DISTINCT FROM OLD.is_demo
-     OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
-    RAISE EXCEPTION 'FORBIDDEN_PRIVILEGE_ESCALATION: Only super_admin may modify protected profile fields';
+  IF (to_jsonb(NEW) - v_allowed) IS DISTINCT FROM (to_jsonb(OLD) - v_allowed) THEN
+    RAISE EXCEPTION 'FORBIDDEN_PRIVILEGE_ESCALATION: Only allowlisted profile columns (full_name, phone, flat_number, avatar_url) may be updated';
   END IF;
 
   RETURN NEW;
@@ -152,14 +144,15 @@ CREATE TRIGGER trg_prevent_profile_escalation
   EXECUTE FUNCTION public.prevent_profile_privilege_escalation();
 
 -- 2.2 Delivery Booking Customer Update Guard:
--- Customers may ONLY update delivery_instructions; slot_id/status/parcel_id/customer_id/reschedule_count
--- must be mutated exclusively via atomic backend RPCs (reserve_delivery_slot / cancel_delivery_booking).
+-- Customers may ONLY modify: delivery_instructions, updated_at.
 CREATE OR REPLACE FUNCTION public.enforce_booking_customer_update()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY INVOKER
 SET search_path = public, pg_temp
 AS $$
+DECLARE
+  v_allowed CONSTANT TEXT[] := ARRAY['delivery_instructions', 'updated_at'];
 BEGIN
   IF auth.role() = 'service_role' OR current_user = 'service_role' THEN
     RETURN NEW;
@@ -175,14 +168,7 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  IF NEW.id IS DISTINCT FROM OLD.id
-     OR NEW.parcel_id IS DISTINCT FROM OLD.parcel_id
-     OR NEW.customer_id IS DISTINCT FROM OLD.customer_id
-     OR NEW.slot_id IS DISTINCT FROM OLD.slot_id
-     OR NEW.status IS DISTINCT FROM OLD.status
-     OR NEW.reschedule_count IS DISTINCT FROM OLD.reschedule_count
-     OR NEW.is_demo IS DISTINCT FROM OLD.is_demo
-     OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+  IF (to_jsonb(NEW) - v_allowed) IS DISTINCT FROM (to_jsonb(OLD) - v_allowed) THEN
     RAISE EXCEPTION 'FORBIDDEN_BOOKING_TAMPERING: Customers may only update delivery_instructions';
   END IF;
 
@@ -200,13 +186,15 @@ CREATE TRIGGER trg_enforce_booking_customer_update
   EXECUTE FUNCTION public.enforce_booking_customer_update();
 
 -- 2.3 Return Request Customer Update Guard:
--- Customers may ONLY update reason, pickup_slot_date, pickup_window while status = 'requested'.
+-- Customers may ONLY modify: reason, pickup_slot_date, pickup_window, updated_at while status = 'requested'.
 CREATE OR REPLACE FUNCTION public.enforce_return_request_customer_update()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY INVOKER
 SET search_path = public, pg_temp
 AS $$
+DECLARE
+  v_allowed CONSTANT TEXT[] := ARRAY['reason', 'pickup_slot_date', 'pickup_window', 'updated_at'];
 BEGIN
   IF auth.role() = 'service_role' OR current_user = 'service_role' THEN
     RETURN NEW;
@@ -223,13 +211,8 @@ BEGIN
   END IF;
 
   IF OLD.status <> 'requested'
-     OR NEW.id IS DISTINCT FROM OLD.id
-     OR NEW.parcel_id IS DISTINCT FROM OLD.parcel_id
-     OR NEW.customer_id IS DISTINCT FROM OLD.customer_id
-     OR NEW.status IS DISTINCT FROM OLD.status
-     OR NEW.is_demo IS DISTINCT FROM OLD.is_demo
-     OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
-    RAISE EXCEPTION 'FORBIDDEN_RETURN_TAMPERING: Customers cannot approve or alter return ownership/status';
+     OR (to_jsonb(NEW) - v_allowed) IS DISTINCT FROM (to_jsonb(OLD) - v_allowed) THEN
+    RAISE EXCEPTION 'FORBIDDEN_RETURN_TAMPERING: Customers may only update reason, pickup_slot_date, or pickup_window while status is requested';
   END IF;
 
   RETURN NEW;
@@ -246,13 +229,15 @@ CREATE TRIGGER trg_enforce_return_request_customer_update
   EXECUTE FUNCTION public.enforce_return_request_customer_update();
 
 -- 2.4 Support Ticket Customer Update Guard:
--- Customers may ONLY update subject, description, priority; status, assigned_to, resolution_notes are admin-only.
+-- Customers may ONLY modify: subject, description, priority, updated_at.
 CREATE OR REPLACE FUNCTION public.enforce_support_ticket_customer_update()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY INVOKER
 SET search_path = public, pg_temp
 AS $$
+DECLARE
+  v_allowed CONSTANT TEXT[] := ARRAY['subject', 'description', 'priority', 'updated_at'];
 BEGIN
   IF auth.role() = 'service_role' OR current_user = 'service_role' THEN
     RETURN NEW;
@@ -268,15 +253,8 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  IF NEW.id IS DISTINCT FROM OLD.id
-     OR NEW.customer_id IS DISTINCT FROM OLD.customer_id
-     OR NEW.parcel_id IS DISTINCT FROM OLD.parcel_id
-     OR NEW.status IS DISTINCT FROM OLD.status
-     OR NEW.assigned_to IS DISTINCT FROM OLD.assigned_to
-     OR NEW.resolution_notes IS DISTINCT FROM OLD.resolution_notes
-     OR NEW.is_demo IS DISTINCT FROM OLD.is_demo
-     OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
-    RAISE EXCEPTION 'FORBIDDEN_TICKET_TAMPERING: Customers cannot modify ticket assignment, status, or resolution_notes';
+  IF (to_jsonb(NEW) - v_allowed) IS DISTINCT FROM (to_jsonb(OLD) - v_allowed) THEN
+    RAISE EXCEPTION 'FORBIDDEN_TICKET_TAMPERING: Customers may only update subject, description, or priority';
   END IF;
 
   RETURN NEW;
@@ -329,7 +307,24 @@ CREATE POLICY roles_authenticated_read ON public.roles
   FOR SELECT TO authenticated
   USING (TRUE);
 
--- 4.2 Profiles: Self read/update (allowlisted columns); society staff scoped to own society; super_admin full
+-- 4.2 Profiles: Revoke broad SELECT from PUBLIC, anon, authenticated so password_hash,
+-- auth_user_id, and email are NEVER directly selectable by clients. service_role retains full access.
+REVOKE SELECT ON public.profiles FROM PUBLIC, anon, authenticated;
+GRANT SELECT (
+  id,
+  full_name,
+  phone,
+  role_code,
+  society_id,
+  unit_id,
+  flat_number,
+  avatar_url,
+  is_active,
+  is_demo,
+  created_at,
+  updated_at
+) ON public.profiles TO authenticated;
+
 DROP POLICY IF EXISTS profiles_self_select ON public.profiles;
 CREATE POLICY profiles_self_select ON public.profiles
   FOR SELECT TO authenticated
@@ -841,3 +836,27 @@ DROP POLICY IF EXISTS audit_logs_super_admin ON public.audit_logs;
 CREATE POLICY audit_logs_super_admin ON public.audit_logs
   FOR SELECT TO authenticated
   USING (public.is_super_admin());
+
+-- ============================================================================
+-- 5. Post-Migration Privilege Verification
+-- ============================================================================
+DO $$
+BEGIN
+  IF has_table_privilege('anon', 'public.profiles', 'SELECT')
+     OR has_table_privilege('authenticated', 'public.profiles', 'SELECT') THEN
+    RAISE EXCEPTION 'PRIVILEGE_CHECK_FAILED: Table-level SELECT on public.profiles must be revoked from anon and authenticated';
+  END IF;
+
+  IF has_column_privilege('authenticated', 'public.profiles', 'password_hash', 'SELECT')
+     OR has_column_privilege('authenticated', 'public.profiles', 'auth_user_id', 'SELECT')
+     OR has_column_privilege('authenticated', 'public.profiles', 'email', 'SELECT') THEN
+    RAISE EXCEPTION 'PRIVILEGE_CHECK_FAILED: Sensitive columns (password_hash, auth_user_id, email) must not be selectable by authenticated';
+  END IF;
+
+  IF NOT has_column_privilege('authenticated', 'public.profiles', 'full_name', 'SELECT')
+     OR NOT has_table_privilege('service_role', 'public.profiles', 'SELECT')
+     OR NOT has_column_privilege('service_role', 'public.profiles', 'password_hash', 'SELECT') THEN
+    RAISE EXCEPTION 'PRIVILEGE_CHECK_FAILED: Expected safe authenticated column SELECT and full service_role SELECT missing';
+  END IF;
+END;
+$$;

@@ -65,6 +65,20 @@ describe('Security: Role Escalation, Tenant Isolation, IDOR, Notification & Driv
     expect(meRes.body.user.is_active).toBe(true);
     expect(meRes.body.user.is_demo).toBe(false);
     expect(meRes.body.user.full_name).toBe('Updated Name');
+    expect(meRes.body.user.password_hash).toBeUndefined();
+
+    // Society admin /users list also never exposes password_hash
+    const socAdminLogin = await request(app).post('/api/v1/auth/login').send({
+      email: 'society.demo@parcelbridge.io',
+      password: 'DemoPass@2026',
+    });
+    const usersRes = await request(app)
+      .get('/api/v1/admin/users')
+      .set('Authorization', `Bearer ${socAdminLogin.body.token}`);
+    expect(usersRes.status).toBe(200);
+    for (const u of usersRes.body.users) {
+      expect(u.password_hash).toBeUndefined();
+    }
   });
 
   it('enforces customer isolation across parcels, bookings (create/reschedule/cancel), and return requests', async () => {
@@ -210,15 +224,33 @@ describe('Security: Role Escalation, Tenant Isolation, IDOR, Notification & Driv
     const sqlPath = path.resolve(__dirname, '../../../database/migrations/202611250002_rls_policies.sql');
     const sql = fs.readFileSync(sqlPath, 'utf8');
 
-    // Profile escalation trigger is SECURITY INVOKER and blocks society_id/unit_id/role_code
+    // Profile column-level SELECT excludes password_hash, auth_user_id, and email for PUBLIC, anon & authenticated
+    expect(sql).toContain('REVOKE SELECT ON public.profiles FROM PUBLIC, anon, authenticated;');
+    expect(sql).toContain('ON public.profiles TO authenticated;');
+    const selectGrantStart = sql.indexOf('REVOKE SELECT ON public.profiles FROM PUBLIC, anon, authenticated;');
+    const selectGrantEnd = sql.indexOf('ON public.profiles TO authenticated;');
+    const selectGrantBlock = sql.slice(selectGrantStart, selectGrantEnd);
+    expect(selectGrantBlock).not.toContain('password_hash');
+    expect(selectGrantBlock).not.toContain('auth_user_id');
+    expect(selectGrantBlock).not.toContain('email');
+    expect(sql).toContain("has_table_privilege('authenticated', 'public.profiles', 'SELECT')");
+    expect(sql).toContain("has_column_privilege('authenticated', 'public.profiles', 'password_hash', 'SELECT')");
+    expect(sql).toContain("has_column_privilege('authenticated', 'public.profiles', 'auth_user_id', 'SELECT')");
+    expect(sql).toContain("has_column_privilege('authenticated', 'public.profiles', 'email', 'SELECT')");
+
+    // Genuine JSONB allowlists in all 4 SECURITY INVOKER triggers
     const profStart = sql.indexOf('CREATE OR REPLACE FUNCTION public.prevent_profile_privilege_escalation()');
     const profEnd = sql.indexOf('CREATE TRIGGER trg_prevent_profile_escalation');
     const profBlock = sql.slice(profStart, profEnd);
     expect(profBlock).toContain('SECURITY INVOKER');
     expect(profBlock).not.toContain('SECURITY DEFINER');
-    expect(profBlock).toContain('NEW.society_id IS DISTINCT FROM OLD.society_id');
-    expect(profBlock).toContain('NEW.unit_id IS DISTINCT FROM OLD.unit_id');
+    expect(profBlock).toContain("ARRAY['full_name', 'phone', 'flat_number', 'avatar_url', 'updated_at']");
+    expect(profBlock).toContain('(to_jsonb(NEW) - v_allowed) IS DISTINCT FROM (to_jsonb(OLD) - v_allowed)');
     expect(profBlock).toContain("NULLIF(current_setting('request.jwt.claims', TRUE), '') IS NULL");
+
+    expect(sql).toContain("ARRAY['delivery_instructions', 'updated_at']");
+    expect(sql).toContain("ARRAY['reason', 'pickup_slot_date', 'pickup_window', 'updated_at']");
+    expect(sql).toContain("ARRAY['subject', 'description', 'priority', 'updated_at']");
 
     // Notifications column-level privilege restricts authenticated UPDATE to is_read only
     expect(sql).toContain('REVOKE UPDATE ON public.notifications FROM authenticated;');
@@ -234,7 +266,7 @@ describe('Security: Role Escalation, Tenant Isolation, IDOR, Notification & Driv
     expect(sql).toContain('CREATE OR REPLACE FUNCTION public.enforce_support_ticket_customer_update()');
     expect(sql).toContain('CREATE POLICY return_requests_customer_insert ON public.return_requests');
     expect(sql).toContain('CREATE POLICY support_tickets_customer_insert ON public.support_tickets');
-    expect(sql).toContain('NEW.created_at IS DISTINCT FROM OLD.created_at');
+    expect(sql).toContain('(to_jsonb(NEW) - v_allowed) IS DISTINCT FROM (to_jsonb(OLD) - v_allowed)');
 
     // Hub manager scoped to society via is_society_staff_of; only super_admin is global
     expect(sql).toContain('CREATE OR REPLACE FUNCTION public.is_super_admin()');
