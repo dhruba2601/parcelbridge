@@ -9,13 +9,12 @@ import { signAuthToken } from '../services/authService';
 
 const app = createApp();
 
-describe('Security: Role Escalation, Customer Isolation, Admin Scope & Delivery Access', () => {
+describe('Security: Role Escalation, Tenant Isolation, IDOR, Notification & Driver Scope', () => {
   beforeEach(() => {
     repo.resetMemoryStore();
   });
 
-  it('prevents privilege escalation on registration and profile update', async () => {
-    // Public registration rejects super_admin role
+  it('prevents privilege escalation and tenant (societyId) reassignment on registration and profile update', async () => {
     const badReg = await request(app).post('/api/v1/auth/register').send({
       email: 'attacker@example.com',
       password: 'Password123!',
@@ -24,17 +23,27 @@ describe('Security: Role Escalation, Customer Isolation, Admin Scope & Delivery 
     });
     expect(badReg.status).toBe(400);
 
-    // Valid customer registration
+    const society1Id = repo.memory.societies[0].id;
+    const society2Id = repo.memory.societies[1].id;
+
     const goodReg = await request(app).post('/api/v1/auth/register').send({
       email: 'user@example.com',
       password: 'Password123!',
       fullName: 'Normal User',
+      societyId: society1Id,
     });
     expect(goodReg.status).toBe(201);
     const token = goodReg.body.token;
-
-    // Attempt to escalate role or mutate privileged profile fields via PATCH /auth/me
     const originalId = goodReg.body.user.id;
+
+    // Customer cannot reassign their own societyId
+    const tenantChangeRes = await request(app)
+      .patch('/api/v1/auth/me')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ societyId: society2Id });
+    expect(tenantChangeRes.status).toBe(403);
+
+    // Attempt to mutate privileged fields via PATCH /auth/me
     await request(app)
       .patch('/api/v1/auth/me')
       .set('Authorization', `Bearer ${token}`)
@@ -51,34 +60,25 @@ describe('Security: Role Escalation, Customer Isolation, Admin Scope & Delivery 
     const meRes = await request(app).get('/api/v1/auth/me').set('Authorization', `Bearer ${token}`);
     expect(meRes.status).toBe(200);
     expect(meRes.body.user.id).toBe(originalId);
+    expect(meRes.body.user.society_id).toBe(society1Id);
     expect(meRes.body.user.role_code).toBe('customer');
     expect(meRes.body.user.is_active).toBe(true);
     expect(meRes.body.user.is_demo).toBe(false);
     expect(meRes.body.user.full_name).toBe('Updated Name');
   });
 
-  it('verifies migration 0002 trigger uses SECURITY INVOKER and checks session_user/jwt claims safely', () => {
-    const sqlPath = path.resolve(__dirname, '../../../database/migrations/202611250002_rls_policies.sql');
-    const sql = fs.readFileSync(sqlPath, 'utf8');
-    const triggerStart = sql.indexOf('CREATE OR REPLACE FUNCTION public.prevent_profile_privilege_escalation()');
-    const triggerEnd = sql.indexOf('CREATE TRIGGER trg_prevent_profile_escalation');
-    const triggerBlock = sql.slice(triggerStart, triggerEnd);
-
-    expect(triggerBlock).toContain('SECURITY INVOKER');
-    expect(triggerBlock).not.toContain('SECURITY DEFINER');
-    expect(triggerBlock).toContain("NULLIF(current_setting('request.jwt.claims', TRUE), '') IS NULL");
-  });
-
-  it('enforces customer isolation across parcels, bookings, and return requests', async () => {
+  it('enforces customer isolation across parcels, bookings (create/reschedule/cancel), and return requests', async () => {
     const regB = await request(app).post('/api/v1/auth/register').send({
       email: 'custb@example.com',
       password: 'Password123!',
       fullName: 'Customer B',
+      societyId: repo.memory.societies[0].id,
     });
     const tokenB = regB.body.token;
 
     const custAParcelId = repo.memory.parcels[0].id;
     const custABookingId = repo.memory.bookings[0].id;
+    const slotId = repo.memory.slots[1].id;
 
     // Customer B cannot read Customer A parcel
     const pRes = await request(app)
@@ -86,13 +86,26 @@ describe('Security: Role Escalation, Customer Isolation, Admin Scope & Delivery 
       .set('Authorization', `Bearer ${tokenB}`);
     expect(pRes.status).toBe(403);
 
-    // Customer B cannot cancel Customer A booking
-    const bRes = await request(app)
+    // Customer B cannot book a slot for Customer A's parcel (Booking IDOR)
+    const bookIdorRes = await request(app)
+      .post('/api/v1/delivery-bookings')
+      .set('Authorization', `Bearer ${tokenB}`)
+      .send({ parcelId: custAParcelId, slotId });
+    expect(bookIdorRes.status).toBe(403);
+
+    // Customer B cannot reschedule or cancel Customer A's booking
+    const reschedRes = await request(app)
+      .patch(`/api/v1/delivery-bookings/${custABookingId}`)
+      .set('Authorization', `Bearer ${tokenB}`)
+      .send({ slotId });
+    expect(reschedRes.status).toBe(404);
+
+    const cancelRes = await request(app)
       .delete(`/api/v1/delivery-bookings/${custABookingId}`)
       .set('Authorization', `Bearer ${tokenB}`);
-    expect(bRes.status).toBe(403);
+    expect(cancelRes.status).toBe(403);
 
-    // Customer B cannot create return request for Customer A parcel
+    // Customer B cannot create return request for Customer A's parcel
     const rRes = await request(app)
       .post('/api/v1/customer/returns')
       .set('Authorization', `Bearer ${tokenB}`)
@@ -100,8 +113,7 @@ describe('Security: Role Escalation, Customer Isolation, Admin Scope & Delivery 
     expect(rRes.status).toBe(403);
   });
 
-  it('scopes society_admin to their own society and restricts super_admin endpoints', async () => {
-    const society1Id = repo.memory.societies[0].id;
+  it('scopes society_admin and hub_manager to their own society and restricts super_admin endpoints', async () => {
     const society2Id = repo.memory.societies[1].id;
     const hub2Id = repo.memory.hubs[1].id;
 
@@ -111,7 +123,12 @@ describe('Security: Role Escalation, Customer Isolation, Admin Scope & Delivery 
     });
     const soc1Token = soc1AdminLogin.body.token;
 
-    // Create a parcel in Society 2
+    const hub1ManagerLogin = await request(app).post('/api/v1/auth/login').send({
+      email: 'hub.demo@parcelbridge.io',
+      password: 'DemoPass@2026',
+    });
+    const hub1Token = hub1ManagerLogin.body.token;
+
     const soc2Parcel = await repo.createParcel({
       internal_parcel_code: 'PB-SOC2-001',
       external_tracking_id: 'TRK-SOC2-001',
@@ -130,22 +147,19 @@ describe('Security: Role Escalation, Customer Isolation, Admin Scope & Delivery 
       is_demo: true,
     });
 
-    // Society 1 admin cannot read or update Society 2 parcel
-    const readSoc2 = await request(app)
-      .get(`/api/v1/parcels/${soc2Parcel.id}`)
-      .set('Authorization', `Bearer ${soc1Token}`);
-    expect(readSoc2.status).toBe(403);
+    // Neither Society 1 admin nor Hub 1 manager can read or update Society 2 parcel
+    for (const tok of [soc1Token, hub1Token]) {
+      const readRes = await request(app).get(`/api/v1/parcels/${soc2Parcel.id}`).set('Authorization', `Bearer ${tok}`);
+      expect(readRes.status).toBe(403);
 
-    const updateSoc2 = await request(app)
-      .patch(`/api/v1/parcels/${soc2Parcel.id}/status`)
-      .set('Authorization', `Bearer ${soc1Token}`)
-      .send({ status: 'Received at hub' });
-    expect(updateSoc2.status).toBe(403);
+      const updateRes = await request(app)
+        .patch(`/api/v1/parcels/${soc2Parcel.id}/status`)
+        .set('Authorization', `Bearer ${tok}`)
+        .send({ status: 'Received at hub' });
+      expect(updateRes.status).toBe(403);
+    }
 
-    // Society 1 admin cannot access super_admin audit logs or create new societies
-    const logsRes = await request(app)
-      .get('/api/v1/admin/audit-logs')
-      .set('Authorization', `Bearer ${soc1Token}`);
+    const logsRes = await request(app).get('/api/v1/admin/audit-logs').set('Authorization', `Bearer ${soc1Token}`);
     expect(logsRes.status).toBe(403);
 
     const createSocRes = await request(app)
@@ -160,7 +174,6 @@ describe('Security: Role Escalation, Customer Isolation, Admin Scope & Delivery 
         postalCode: '12345',
       });
     expect(createSocRes.status).toBe(403);
-    expect(society1Id).not.toBe(society2Id);
   });
 
   it('restricts delivery_personnel to their own assigned parcels', async () => {
@@ -174,7 +187,6 @@ describe('Security: Role Escalation, Customer Isolation, Admin Scope & Delivery 
 
     const assignedParcelId = repo.memory.parcels[1].id;
 
-    // Unassigned driver cannot verify OTP, confirm delivery, or mark failed
     const verifyRes = await request(app)
       .post('/api/v1/delivery/verify-otp')
       .set('Authorization', `Bearer ${otherDriverToken}`)
@@ -192,5 +204,36 @@ describe('Security: Role Escalation, Customer Isolation, Admin Scope & Delivery 
       .set('Authorization', `Bearer ${otherDriverToken}`)
       .send({ parcelId: assignedParcelId, reason: 'Not assigned' });
     expect(failRes.status).toBe(403);
+  });
+
+  it('verifies migration 0002 SQL security controls (column grants, triggers, scoping, recursion helper)', () => {
+    const sqlPath = path.resolve(__dirname, '../../../database/migrations/202611250002_rls_policies.sql');
+    const sql = fs.readFileSync(sqlPath, 'utf8');
+
+    // Profile escalation trigger is SECURITY INVOKER and blocks society_id/unit_id/role_code
+    const profStart = sql.indexOf('CREATE OR REPLACE FUNCTION public.prevent_profile_privilege_escalation()');
+    const profEnd = sql.indexOf('CREATE TRIGGER trg_prevent_profile_escalation');
+    const profBlock = sql.slice(profStart, profEnd);
+    expect(profBlock).toContain('SECURITY INVOKER');
+    expect(profBlock).not.toContain('SECURITY DEFINER');
+    expect(profBlock).toContain('NEW.society_id IS DISTINCT FROM OLD.society_id');
+    expect(profBlock).toContain('NEW.unit_id IS DISTINCT FROM OLD.unit_id');
+    expect(profBlock).toContain("NULLIF(current_setting('request.jwt.claims', TRUE), '') IS NULL");
+
+    // Notifications column-level privilege restricts authenticated UPDATE to is_read only
+    expect(sql).toContain('REVOKE UPDATE ON public.notifications FROM authenticated;');
+    expect(sql).toContain('GRANT UPDATE (is_read) ON public.notifications TO authenticated;');
+
+    // Driver assignment update policy & SECURITY INVOKER trigger
+    expect(sql).toContain('CREATE POLICY delivery_assignments_driver_update ON public.delivery_assignments');
+    expect(sql).toContain('CREATE OR REPLACE FUNCTION public.enforce_driver_assignment_update()');
+
+    // Hub manager scoped to society via is_society_staff_of; only super_admin is global
+    expect(sql).toContain('CREATE OR REPLACE FUNCTION public.is_super_admin()');
+    expect(sql).toContain('CREATE OR REPLACE FUNCTION public.is_society_staff_of(target_society_id UUID)');
+    expect(sql).not.toContain('is_global_admin');
+
+    // Recursion helper preserved
+    expect(sql).toContain('CREATE OR REPLACE FUNCTION public.is_driver_assigned_to_parcel(target_parcel_id UUID)');
   });
 });

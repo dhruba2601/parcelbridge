@@ -79,8 +79,8 @@ export async function transitionParcelStatus(
     throw new AppError(404, 'Parcel not found', 'NOT_FOUND');
   }
 
-  if (actor.role === 'society_admin' && actor.societyId && parcel.society_id !== actor.societyId) {
-    throw new AppError(403, 'Society admin cannot modify parcels in another society', 'FORBIDDEN');
+  if ((actor.role === 'society_admin' || actor.role === 'hub_manager') && actor.societyId && parcel.society_id !== actor.societyId) {
+    throw new AppError(403, 'Society/hub staff cannot modify parcels in another society', 'FORBIDDEN');
   }
 
   if (!canTransitionParcelStatus(parcel.current_status, newStatus)) {
@@ -127,15 +127,15 @@ export async function getParcelWithHistory(parcelId: string, actor: AuthTokenPay
     throw new AppError(404, 'Parcel not found', 'NOT_FOUND');
   }
 
-  if (actor.role === 'society_admin' && actor.societyId && parcel.society_id !== actor.societyId) {
-    throw new AppError(403, 'Society admin cannot modify parcels in another society', 'FORBIDDEN');
+  if ((actor.role === 'society_admin' || actor.role === 'hub_manager') && actor.societyId && parcel.society_id !== actor.societyId) {
+    throw new AppError(403, 'Society/hub staff cannot modify parcels in another society', 'FORBIDDEN');
   }
 
   if (actor.role === 'customer' && parcel.customer_id !== actor.sub) {
     throw new AppError(403, 'You can only access your own parcels', 'FORBIDDEN');
   }
 
-  if (actor.role === 'society_admin' && actor.societyId && parcel.society_id !== actor.societyId) {
+  if ((actor.role === 'society_admin' || actor.role === 'hub_manager') && actor.societyId && parcel.society_id !== actor.societyId) {
     throw new AppError(403, 'Parcel belongs to a different residential society', 'FORBIDDEN');
   }
 

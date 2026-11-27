@@ -39,6 +39,14 @@ export async function meController(req: Request, res: Response, next: NextFuncti
 
 export async function updateMeController(req: Request, res: Response, next: NextFunction) {
   try {
+    if (req.body.societyId !== undefined && req.user!.role !== 'super_admin') {
+      res.status(403).json({
+        error: 'Only administrators may reassign residential society membership',
+        code: 'FORBIDDEN_TENANT_CHANGE',
+      });
+      return;
+    }
+
     const updated = await repo.updateProfile(req.user!.sub, {
       ...(req.body.fullName !== undefined ? { full_name: req.body.fullName } : {}),
       ...(req.body.phone !== undefined ? { phone: req.body.phone } : {}),

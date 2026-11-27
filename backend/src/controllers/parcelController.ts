@@ -42,7 +42,7 @@ export async function listParcelsController(req: Request, res: Response, next: N
     const filter =
       user.role === 'customer'
         ? { customerId: user.sub }
-        : user.role === 'society_admin' && user.societyId
+        : (user.role === 'society_admin' || user.role === 'hub_manager') && user.societyId
           ? { societyId: user.societyId }
           : undefined;
     const parcels = await repo.listParcels(filter);
