@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import request from 'supertest';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { v4 as uuidv4 } from 'uuid';
@@ -31,15 +33,40 @@ describe('Security: Role Escalation, Customer Isolation, Admin Scope & Delivery 
     expect(goodReg.status).toBe(201);
     const token = goodReg.body.token;
 
-    // Attempt to escalate role via PATCH /auth/me
+    // Attempt to escalate role or mutate privileged profile fields via PATCH /auth/me
+    const originalId = goodReg.body.user.id;
     await request(app)
       .patch('/api/v1/auth/me')
       .set('Authorization', `Bearer ${token}`)
-      .send({ role_code: 'super_admin', role: 'super_admin', fullName: 'Updated Name' });
+      .send({
+        id: uuidv4(),
+        auth_user_id: uuidv4(),
+        role_code: 'super_admin',
+        role: 'super_admin',
+        is_active: false,
+        is_demo: true,
+        fullName: 'Updated Name',
+      });
 
     const meRes = await request(app).get('/api/v1/auth/me').set('Authorization', `Bearer ${token}`);
     expect(meRes.status).toBe(200);
+    expect(meRes.body.user.id).toBe(originalId);
     expect(meRes.body.user.role_code).toBe('customer');
+    expect(meRes.body.user.is_active).toBe(true);
+    expect(meRes.body.user.is_demo).toBe(false);
+    expect(meRes.body.user.full_name).toBe('Updated Name');
+  });
+
+  it('verifies migration 0002 trigger uses SECURITY INVOKER and checks session_user/jwt claims safely', () => {
+    const sqlPath = path.resolve(__dirname, '../../../database/migrations/202611250002_rls_policies.sql');
+    const sql = fs.readFileSync(sqlPath, 'utf8');
+    const triggerStart = sql.indexOf('CREATE OR REPLACE FUNCTION public.prevent_profile_privilege_escalation()');
+    const triggerEnd = sql.indexOf('CREATE TRIGGER trg_prevent_profile_escalation');
+    const triggerBlock = sql.slice(triggerStart, triggerEnd);
+
+    expect(triggerBlock).toContain('SECURITY INVOKER');
+    expect(triggerBlock).not.toContain('SECURITY DEFINER');
+    expect(triggerBlock).toContain("NULLIF(current_setting('request.jwt.claims', TRUE), '') IS NULL");
   });
 
   it('enforces customer isolation across parcels, bookings, and return requests', async () => {

@@ -97,18 +97,30 @@ GRANT EXECUTE ON FUNCTION public.is_driver_assigned_to_parcel(UUID) TO authentic
 -- ============================================================================
 -- 2. Defense-in-Depth Trigger: Prevent Profile Privilege Escalation
 -- ============================================================================
+-- Uses SECURITY INVOKER so current_user reflects the actual caller role
+-- (authenticated, service_role, or postgres) rather than the function owner.
 
 CREATE OR REPLACE FUNCTION public.prevent_profile_privilege_escalation()
 RETURNS TRIGGER
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY INVOKER
 SET search_path = public, pg_temp
 AS $$
 BEGIN
-  -- Backend service_role, DB admin roles, and super_admin may update privileged columns
-  IF current_user IN ('postgres', 'supabase_admin', 'service_role')
-     OR auth.role() = 'service_role'
-     OR public.current_role_code() = 'super_admin' THEN
+  -- 1. Authorized backend service_role client
+  IF auth.role() = 'service_role' OR current_user = 'service_role' THEN
+    RETURN NEW;
+  END IF;
+
+  -- 2. Trusted direct DB maintenance (SQL Editor / migrations) with no PostgREST JWT context
+  IF session_user IN ('postgres', 'supabase_admin')
+     AND current_user IN ('postgres', 'supabase_admin')
+     AND NULLIF(current_setting('request.jwt.claims', TRUE), '') IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  -- 3. Authenticated super_admin user
+  IF auth.role() = 'authenticated' AND public.current_role_code() = 'super_admin' THEN
     RETURN NEW;
   END IF;
 
@@ -123,6 +135,9 @@ BEGIN
   RETURN NEW;
 END;
 $$;
+
+REVOKE ALL ON FUNCTION public.prevent_profile_privilege_escalation() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.prevent_profile_privilege_escalation() TO authenticated, service_role;
 
 DROP TRIGGER IF EXISTS trg_prevent_profile_escalation ON public.profiles;
 CREATE TRIGGER trg_prevent_profile_escalation
