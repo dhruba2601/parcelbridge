@@ -236,4 +236,66 @@ describe('PARCELBRIDGE Complete 12-Step E2E Workflows', () => {
     expect(partnerRes.status).toBe(201);
     expect(partnerRes.body.application.status).toBe('pending');
   });
+
+  it('TEST 13: Booking cancellation restores slot capacity, plus return request, support ticket, and public tracking', async () => {
+    const slotRes = await request(app)
+      .post('/api/v1/delivery-slots')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        hubId,
+        societyId,
+        slotDate: '2026-12-08',
+        startTime: '14:00:00',
+        endTime: '16:00:00',
+        maxCapacity: 1,
+      });
+    const cancelSlotId = slotRes.body.slot.id;
+
+    const p3Res = await request(app)
+      .post('/api/v1/parcels')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        externalTrackingId: 'E2E-TRK-9003',
+        customerId,
+        societyId,
+        hubId,
+        courierName: 'XpressBees',
+        description: 'E2E Cancel & Return Test Parcel',
+        initialStatus: 'Stored',
+      });
+    const p3Id = p3Res.body.parcel.id;
+
+    const bookRes = await request(app)
+      .post('/api/v1/delivery-bookings')
+      .set('Authorization', `Bearer ${customerToken}`)
+      .send({ parcelId: p3Id, slotId: cancelSlotId });
+    expect(bookRes.status).toBe(201);
+    const bookingId = bookRes.body.booking.booking_id;
+
+    const delRes = await request(app)
+      .delete(`/api/v1/delivery-bookings/${bookingId}`)
+      .set('Authorization', `Bearer ${customerToken}`);
+    expect(delRes.status).toBe(200);
+    expect(delRes.body.booking.status).toBe('cancelled');
+
+    const slotsAfter = await request(app).get(`/api/v1/delivery-slots?societyId=${societyId}`);
+    const restored = slotsAfter.body.slots.find((s: { id: string }) => s.id === cancelSlotId);
+    expect(restored.booked_count).toBe(0);
+
+    const retRes = await request(app)
+      .post('/api/v1/customer/returns')
+      .set('Authorization', `Bearer ${customerToken}`)
+      .send({ parcelId, reason: 'Wrong size ordered' });
+    expect(retRes.status).toBe(201);
+
+    const ticketRes = await request(app)
+      .post('/api/v1/customer/support-tickets')
+      .set('Authorization', `Bearer ${customerToken}`)
+      .send({ parcelId, subject: 'Package dent', description: 'Outer box slightly dented on arrival' });
+    expect(ticketRes.status).toBe(201);
+
+    const trackRes = await request(app).get('/api/v1/parcels/track/E2E-TRK-9003');
+    expect(trackRes.status).toBe(200);
+    expect(trackRes.body.tracking.externalTrackingId).toBe('E2E-TRK-9003');
+  });
 });
