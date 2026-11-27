@@ -71,10 +71,14 @@ adminRouter.get(
   '/users',
   authenticate,
   requireRoles('super_admin', 'society_admin'),
-  async (_req, res, next) => {
+  async (req, res, next) => {
     try {
       const users = await repo.listProfiles();
-      res.json({ users });
+      const scoped =
+        req.user!.role === 'society_admin' && req.user!.societyId
+          ? users.filter((u) => u.society_id === req.user!.societyId)
+          : users;
+      res.json({ users: scoped });
     } catch (err) {
       next(err);
     }
@@ -102,7 +106,7 @@ adminRouter.get(
 adminRouter.post(
   '/societies',
   authenticate,
-  requireRoles('super_admin', 'society_admin'),
+  requireRoles('super_admin'),
   validateBody(createSocietySchema),
   async (req, res, next) => {
     try {

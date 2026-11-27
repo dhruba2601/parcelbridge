@@ -11,14 +11,13 @@ out/
 coverage/
 *.tsbuildinfo
 
-# Environment files
+# Environment files (keep real credentials out of Git and ZIP uploads)
 .env
-.env.txt
+.env.*
+!.env.example
+*.env
 *.env.txt
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+!.env.example
 
 # Logs
 npm-debug.log*

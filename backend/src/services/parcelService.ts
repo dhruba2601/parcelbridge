@@ -79,6 +79,10 @@ export async function transitionParcelStatus(
     throw new AppError(404, 'Parcel not found', 'NOT_FOUND');
   }
 
+  if (actor.role === 'society_admin' && actor.societyId && parcel.society_id !== actor.societyId) {
+    throw new AppError(403, 'Society admin cannot modify parcels in another society', 'FORBIDDEN');
+  }
+
   if (!canTransitionParcelStatus(parcel.current_status, newStatus)) {
     throw new AppError(
       400,
@@ -121,6 +125,10 @@ export async function getParcelWithHistory(parcelId: string, actor: AuthTokenPay
   const parcel = await repo.findParcelById(parcelId);
   if (!parcel) {
     throw new AppError(404, 'Parcel not found', 'NOT_FOUND');
+  }
+
+  if (actor.role === 'society_admin' && actor.societyId && parcel.society_id !== actor.societyId) {
+    throw new AppError(403, 'Society admin cannot modify parcels in another society', 'FORBIDDEN');
   }
 
   if (actor.role === 'customer' && parcel.customer_id !== actor.sub) {
