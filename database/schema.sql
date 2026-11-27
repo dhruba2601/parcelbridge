@@ -448,8 +448,10 @@ GRANT EXECUTE ON FUNCTION public.is_driver_assigned_to_parcel(UUID) TO authentic
 -- 2. Defense-in-Depth Triggers (SECURITY INVOKER)
 -- ============================================================================
 
--- 2.1 Prevent Profile Privilege & Tenant Escalation
--- Only full_name, phone, flat_number, and avatar_url may be updated by non-super_admin users.
+-- 2.1 Profile Complete Allowlist:
+-- Ordinary users may ONLY update: full_name, phone, flat_number, avatar_url (+ updated_at).
+-- All other columns (id, auth_user_id, email, password_hash, role_code, society_id, unit_id,
+-- is_active, is_demo, created_at) are locked unless caller is service_role, SQL Editor, or super_admin.
 CREATE OR REPLACE FUNCTION public.prevent_profile_privilege_escalation()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -457,24 +459,20 @@ SECURITY INVOKER
 SET search_path = public, pg_temp
 AS $$
 BEGIN
-  -- 1. Authorized backend service_role client
   IF auth.role() = 'service_role' OR current_user = 'service_role' THEN
     RETURN NEW;
   END IF;
 
-  -- 2. Trusted direct DB maintenance (SQL Editor / migrations) with no PostgREST JWT context
   IF session_user IN ('postgres', 'supabase_admin')
      AND current_user IN ('postgres', 'supabase_admin')
      AND NULLIF(current_setting('request.jwt.claims', TRUE), '') IS NULL THEN
     RETURN NEW;
   END IF;
 
-  -- 3. Authenticated super_admin user
   IF auth.role() = 'authenticated' AND public.current_role_code() = 'super_admin' THEN
     RETURN NEW;
   END IF;
 
-  -- Block changes to identity, credentials, role, tenant/unit association, and lifecycle flags
   IF NEW.id IS DISTINCT FROM OLD.id
      OR NEW.auth_user_id IS DISTINCT FROM OLD.auth_user_id
      OR NEW.email IS DISTINCT FROM OLD.email
@@ -483,8 +481,9 @@ BEGIN
      OR NEW.society_id IS DISTINCT FROM OLD.society_id
      OR NEW.unit_id IS DISTINCT FROM OLD.unit_id
      OR NEW.is_active IS DISTINCT FROM OLD.is_active
-     OR NEW.is_demo IS DISTINCT FROM OLD.is_demo THEN
-    RAISE EXCEPTION 'FORBIDDEN_PRIVILEGE_ESCALATION: Only super_admin may modify privileged or tenant profile fields';
+     OR NEW.is_demo IS DISTINCT FROM OLD.is_demo
+     OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+    RAISE EXCEPTION 'FORBIDDEN_PRIVILEGE_ESCALATION: Only super_admin may modify protected profile fields';
   END IF;
 
   RETURN NEW;
@@ -500,8 +499,10 @@ CREATE TRIGGER trg_prevent_profile_escalation
   FOR EACH ROW
   EXECUTE FUNCTION public.prevent_profile_privilege_escalation();
 
--- 2.2 Restrict Delivery Personnel Assignment Updates to Safe Delivery Fields
-CREATE OR REPLACE FUNCTION public.enforce_driver_assignment_update()
+-- 2.2 Delivery Booking Customer Update Guard:
+-- Customers may ONLY update delivery_instructions; slot_id/status/parcel_id/customer_id/reschedule_count
+-- must be mutated exclusively via atomic backend RPCs (reserve_delivery_slot / cancel_delivery_booking).
+CREATE OR REPLACE FUNCTION public.enforce_booking_customer_update()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY INVOKER
@@ -522,30 +523,126 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  -- Drivers may only update status, failure_reason, completed_at (preserving parcel_id, personnel_id, booking_id)
   IF NEW.id IS DISTINCT FROM OLD.id
      OR NEW.parcel_id IS DISTINCT FROM OLD.parcel_id
-     OR NEW.booking_id IS DISTINCT FROM OLD.booking_id
-     OR NEW.personnel_id IS DISTINCT FROM OLD.personnel_id
-     OR NEW.assigned_by IS DISTINCT FROM OLD.assigned_by
-     OR NEW.route_sequence IS DISTINCT FROM OLD.route_sequence
+     OR NEW.customer_id IS DISTINCT FROM OLD.customer_id
+     OR NEW.slot_id IS DISTINCT FROM OLD.slot_id
+     OR NEW.status IS DISTINCT FROM OLD.status
+     OR NEW.reschedule_count IS DISTINCT FROM OLD.reschedule_count
      OR NEW.is_demo IS DISTINCT FROM OLD.is_demo
-     OR NEW.status NOT IN ('in_progress', 'completed', 'failed') THEN
-    RAISE EXCEPTION 'FORBIDDEN_ASSIGNMENT_TAMPERING: Drivers may only update delivery status fields';
+     OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+    RAISE EXCEPTION 'FORBIDDEN_BOOKING_TAMPERING: Customers may only update delivery_instructions';
   END IF;
 
   RETURN NEW;
 END;
 $$;
 
-REVOKE ALL ON FUNCTION public.enforce_driver_assignment_update() FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.enforce_driver_assignment_update() TO authenticated, service_role;
+REVOKE ALL ON FUNCTION public.enforce_booking_customer_update() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.enforce_booking_customer_update() TO authenticated, service_role;
 
-DROP TRIGGER IF EXISTS trg_enforce_driver_assignment_update ON public.delivery_assignments;
-CREATE TRIGGER trg_enforce_driver_assignment_update
-  BEFORE UPDATE ON public.delivery_assignments
+DROP TRIGGER IF EXISTS trg_enforce_booking_customer_update ON public.delivery_bookings;
+CREATE TRIGGER trg_enforce_booking_customer_update
+  BEFORE UPDATE ON public.delivery_bookings
   FOR EACH ROW
-  EXECUTE FUNCTION public.enforce_driver_assignment_update();
+  EXECUTE FUNCTION public.enforce_booking_customer_update();
+
+-- 2.3 Return Request Customer Update Guard:
+-- Customers may ONLY update reason, pickup_slot_date, pickup_window while status = 'requested'.
+CREATE OR REPLACE FUNCTION public.enforce_return_request_customer_update()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  IF auth.role() = 'service_role' OR current_user = 'service_role' THEN
+    RETURN NEW;
+  END IF;
+
+  IF session_user IN ('postgres', 'supabase_admin')
+     AND current_user IN ('postgres', 'supabase_admin')
+     AND NULLIF(current_setting('request.jwt.claims', TRUE), '') IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  IF auth.role() = 'authenticated' AND public.current_role_code() IN ('super_admin', 'society_admin', 'hub_manager') THEN
+    RETURN NEW;
+  END IF;
+
+  IF OLD.status <> 'requested'
+     OR NEW.id IS DISTINCT FROM OLD.id
+     OR NEW.parcel_id IS DISTINCT FROM OLD.parcel_id
+     OR NEW.customer_id IS DISTINCT FROM OLD.customer_id
+     OR NEW.status IS DISTINCT FROM OLD.status
+     OR NEW.is_demo IS DISTINCT FROM OLD.is_demo
+     OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+    RAISE EXCEPTION 'FORBIDDEN_RETURN_TAMPERING: Customers cannot approve or alter return ownership/status';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.enforce_return_request_customer_update() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.enforce_return_request_customer_update() TO authenticated, service_role;
+
+DROP TRIGGER IF EXISTS trg_enforce_return_request_customer_update ON public.return_requests;
+CREATE TRIGGER trg_enforce_return_request_customer_update
+  BEFORE UPDATE ON public.return_requests
+  FOR EACH ROW
+  EXECUTE FUNCTION public.enforce_return_request_customer_update();
+
+-- 2.4 Support Ticket Customer Update Guard:
+-- Customers may ONLY update subject, description, priority; status, assigned_to, resolution_notes are admin-only.
+CREATE OR REPLACE FUNCTION public.enforce_support_ticket_customer_update()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  IF auth.role() = 'service_role' OR current_user = 'service_role' THEN
+    RETURN NEW;
+  END IF;
+
+  IF session_user IN ('postgres', 'supabase_admin')
+     AND current_user IN ('postgres', 'supabase_admin')
+     AND NULLIF(current_setting('request.jwt.claims', TRUE), '') IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  IF auth.role() = 'authenticated' AND public.current_role_code() IN ('super_admin', 'society_admin', 'hub_manager') THEN
+    RETURN NEW;
+  END IF;
+
+  IF NEW.id IS DISTINCT FROM OLD.id
+     OR NEW.customer_id IS DISTINCT FROM OLD.customer_id
+     OR NEW.parcel_id IS DISTINCT FROM OLD.parcel_id
+     OR NEW.status IS DISTINCT FROM OLD.status
+     OR NEW.assigned_to IS DISTINCT FROM OLD.assigned_to
+     OR NEW.resolution_notes IS DISTINCT FROM OLD.resolution_notes
+     OR NEW.is_demo IS DISTINCT FROM OLD.is_demo
+     OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+    RAISE EXCEPTION 'FORBIDDEN_TICKET_TAMPERING: Customers cannot modify ticket assignment, status, or resolution_notes';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.enforce_support_ticket_customer_update() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.enforce_support_ticket_customer_update() TO authenticated, service_role;
+
+DROP TRIGGER IF EXISTS trg_enforce_support_ticket_customer_update ON public.support_tickets;
+CREATE TRIGGER trg_enforce_support_ticket_customer_update
+  BEFORE UPDATE ON public.support_tickets
+  FOR EACH ROW
+  EXECUTE FUNCTION public.enforce_support_ticket_customer_update();
+
+-- Remove obsolete direct-driver assignment trigger if present from earlier revision
+DROP TRIGGER IF EXISTS trg_enforce_driver_assignment_update ON public.delivery_assignments;
+DROP FUNCTION IF EXISTS public.enforce_driver_assignment_update();
 
 -- ============================================================================
 -- 3. Enable RLS on All 18 Application Tables
@@ -580,7 +677,7 @@ CREATE POLICY roles_authenticated_read ON public.roles
   FOR SELECT TO authenticated
   USING (TRUE);
 
--- 4.2 Profiles: Self read/update (non-privileged fields); society staff scoped to own society; super_admin full
+-- 4.2 Profiles: Self read/update (allowlisted columns); society staff scoped to own society; super_admin full
 DROP POLICY IF EXISTS profiles_self_select ON public.profiles;
 CREATE POLICY profiles_self_select ON public.profiles
   FOR SELECT TO authenticated
@@ -746,7 +843,9 @@ CREATE POLICY delivery_slots_admin_write ON public.delivery_slots
     OR public.is_society_staff_of(society_id)
   );
 
--- 4.9 Delivery Bookings: Customer owns booking AND referenced parcel; society staff scoped via parcel society
+-- 4.9 Delivery Bookings:
+-- Customers read own bookings and may only update delivery_instructions (protected by trigger).
+-- Booking creation/rescheduling/cancellation must go through atomic RPCs (service_role) or scoped admin.
 DROP POLICY IF EXISTS delivery_bookings_select ON public.delivery_bookings;
 CREATE POLICY delivery_bookings_select ON public.delivery_bookings
   FOR SELECT TO authenticated
@@ -761,18 +860,11 @@ CREATE POLICY delivery_bookings_select ON public.delivery_bookings
   );
 
 DROP POLICY IF EXISTS delivery_bookings_insert ON public.delivery_bookings;
-CREATE POLICY delivery_bookings_insert ON public.delivery_bookings
+DROP POLICY IF EXISTS delivery_bookings_admin_insert ON public.delivery_bookings;
+CREATE POLICY delivery_bookings_admin_insert ON public.delivery_bookings
   FOR INSERT TO authenticated
   WITH CHECK (
-    (
-      customer_id = public.current_profile_id()
-      AND EXISTS (
-        SELECT 1 FROM public.parcels p
-        WHERE p.id = delivery_bookings.parcel_id
-          AND p.customer_id = public.current_profile_id()
-      )
-    )
-    OR public.is_super_admin()
+    public.is_super_admin()
     OR EXISTS (
       SELECT 1 FROM public.parcels p
       WHERE p.id = delivery_bookings.parcel_id
@@ -781,18 +873,31 @@ CREATE POLICY delivery_bookings_insert ON public.delivery_bookings
   );
 
 DROP POLICY IF EXISTS delivery_bookings_update ON public.delivery_bookings;
-CREATE POLICY delivery_bookings_update ON public.delivery_bookings
+DROP POLICY IF EXISTS delivery_bookings_customer_update ON public.delivery_bookings;
+CREATE POLICY delivery_bookings_customer_update ON public.delivery_bookings
   FOR UPDATE TO authenticated
   USING (
-    (
-      customer_id = public.current_profile_id()
-      AND EXISTS (
-        SELECT 1 FROM public.parcels p
-        WHERE p.id = delivery_bookings.parcel_id
-          AND p.customer_id = public.current_profile_id()
-      )
+    customer_id = public.current_profile_id()
+    AND EXISTS (
+      SELECT 1 FROM public.parcels p
+      WHERE p.id = delivery_bookings.parcel_id
+        AND p.customer_id = public.current_profile_id()
     )
-    OR public.is_super_admin()
+  )
+  WITH CHECK (
+    customer_id = public.current_profile_id()
+    AND EXISTS (
+      SELECT 1 FROM public.parcels p
+      WHERE p.id = delivery_bookings.parcel_id
+        AND p.customer_id = public.current_profile_id()
+    )
+  );
+
+DROP POLICY IF EXISTS delivery_bookings_admin_update ON public.delivery_bookings;
+CREATE POLICY delivery_bookings_admin_update ON public.delivery_bookings
+  FOR UPDATE TO authenticated
+  USING (
+    public.is_super_admin()
     OR EXISTS (
       SELECT 1 FROM public.parcels p
       WHERE p.id = delivery_bookings.parcel_id
@@ -800,15 +905,7 @@ CREATE POLICY delivery_bookings_update ON public.delivery_bookings
     )
   )
   WITH CHECK (
-    (
-      customer_id = public.current_profile_id()
-      AND EXISTS (
-        SELECT 1 FROM public.parcels p
-        WHERE p.id = delivery_bookings.parcel_id
-          AND p.customer_id = public.current_profile_id()
-      )
-    )
-    OR public.is_super_admin()
+    public.is_super_admin()
     OR EXISTS (
       SELECT 1 FROM public.parcels p
       WHERE p.id = delivery_bookings.parcel_id
@@ -850,7 +947,9 @@ CREATE POLICY delivery_personnel_admin_write ON public.delivery_personnel
     )
   );
 
--- 4.11 Delivery Assignments: Assigned driver read + safe status update; super_admin & scoped society staff manage
+-- 4.11 Delivery Assignments:
+-- Assigned drivers have READ-ONLY access. All assignment updates (including completion) must go
+-- through the Express backend (service_role) after OTP verification, or scoped admin/super_admin.
 DROP POLICY IF EXISTS delivery_assignments_select ON public.delivery_assignments;
 CREATE POLICY delivery_assignments_select ON public.delivery_assignments
   FOR SELECT TO authenticated
@@ -869,23 +968,6 @@ CREATE POLICY delivery_assignments_select ON public.delivery_assignments
   );
 
 DROP POLICY IF EXISTS delivery_assignments_driver_update ON public.delivery_assignments;
-CREATE POLICY delivery_assignments_driver_update ON public.delivery_assignments
-  FOR UPDATE TO authenticated
-  USING (
-    EXISTS (
-      SELECT 1 FROM public.delivery_personnel dp
-      WHERE dp.id = delivery_assignments.personnel_id
-        AND dp.profile_id = public.current_profile_id()
-    )
-  )
-  WITH CHECK (
-    EXISTS (
-      SELECT 1 FROM public.delivery_personnel dp
-      WHERE dp.id = delivery_assignments.personnel_id
-        AND dp.profile_id = public.current_profile_id()
-    )
-    AND status IN ('in_progress', 'completed', 'failed')
-  );
 
 DROP POLICY IF EXISTS delivery_assignments_admin_write ON public.delivery_assignments;
 CREATE POLICY delivery_assignments_admin_write ON public.delivery_assignments
@@ -968,35 +1050,13 @@ CREATE POLICY business_partners_super_admin_update ON public.business_partners
   USING (public.is_super_admin())
   WITH CHECK (public.is_super_admin());
 
--- 4.16 Return Requests: Customer owns request AND referenced parcel; society staff scoped via parcel society
+-- 4.16 Return Requests: Split SELECT, INSERT, UPDATE (customers cannot approve or alter status/ownership)
 DROP POLICY IF EXISTS return_requests_owner ON public.return_requests;
-CREATE POLICY return_requests_owner ON public.return_requests
-  FOR ALL TO authenticated
+DROP POLICY IF EXISTS return_requests_select ON public.return_requests;
+CREATE POLICY return_requests_select ON public.return_requests
+  FOR SELECT TO authenticated
   USING (
-    (
-      customer_id = public.current_profile_id()
-      AND EXISTS (
-        SELECT 1 FROM public.parcels p
-        WHERE p.id = return_requests.parcel_id
-          AND p.customer_id = public.current_profile_id()
-      )
-    )
-    OR public.is_super_admin()
-    OR EXISTS (
-      SELECT 1 FROM public.parcels p
-      WHERE p.id = return_requests.parcel_id
-        AND public.is_society_staff_of(p.society_id)
-    )
-  )
-  WITH CHECK (
-    (
-      customer_id = public.current_profile_id()
-      AND EXISTS (
-        SELECT 1 FROM public.parcels p
-        WHERE p.id = return_requests.parcel_id
-          AND p.customer_id = public.current_profile_id()
-      )
-    )
+    customer_id = public.current_profile_id()
     OR public.is_super_admin()
     OR EXISTS (
       SELECT 1 FROM public.parcels p
@@ -1005,10 +1065,66 @@ CREATE POLICY return_requests_owner ON public.return_requests
     )
   );
 
--- 4.17 Support Tickets: Customer owns ticket; society staff scoped to customer's society; super_admin all
-DROP POLICY IF EXISTS support_tickets_owner ON public.support_tickets;
-CREATE POLICY support_tickets_owner ON public.support_tickets
+DROP POLICY IF EXISTS return_requests_customer_insert ON public.return_requests;
+CREATE POLICY return_requests_customer_insert ON public.return_requests
+  FOR INSERT TO authenticated
+  WITH CHECK (
+    customer_id = public.current_profile_id()
+    AND status = 'requested'
+    AND is_demo = FALSE
+    AND EXISTS (
+      SELECT 1 FROM public.parcels p
+      WHERE p.id = return_requests.parcel_id
+        AND p.customer_id = public.current_profile_id()
+    )
+  );
+
+DROP POLICY IF EXISTS return_requests_customer_update ON public.return_requests;
+CREATE POLICY return_requests_customer_update ON public.return_requests
+  FOR UPDATE TO authenticated
+  USING (
+    customer_id = public.current_profile_id()
+    AND EXISTS (
+      SELECT 1 FROM public.parcels p
+      WHERE p.id = return_requests.parcel_id
+        AND p.customer_id = public.current_profile_id()
+    )
+  )
+  WITH CHECK (
+    customer_id = public.current_profile_id()
+    AND status = 'requested'
+    AND EXISTS (
+      SELECT 1 FROM public.parcels p
+      WHERE p.id = return_requests.parcel_id
+        AND p.customer_id = public.current_profile_id()
+    )
+  );
+
+DROP POLICY IF EXISTS return_requests_admin_write ON public.return_requests;
+CREATE POLICY return_requests_admin_write ON public.return_requests
   FOR ALL TO authenticated
+  USING (
+    public.is_super_admin()
+    OR EXISTS (
+      SELECT 1 FROM public.parcels p
+      WHERE p.id = return_requests.parcel_id
+        AND public.is_society_staff_of(p.society_id)
+    )
+  )
+  WITH CHECK (
+    public.is_super_admin()
+    OR EXISTS (
+      SELECT 1 FROM public.parcels p
+      WHERE p.id = return_requests.parcel_id
+        AND public.is_society_staff_of(p.society_id)
+    )
+  );
+
+-- 4.17 Support Tickets: Split SELECT, INSERT, UPDATE (customers cannot alter status, assigned_to, resolution_notes)
+DROP POLICY IF EXISTS support_tickets_owner ON public.support_tickets;
+DROP POLICY IF EXISTS support_tickets_select ON public.support_tickets;
+CREATE POLICY support_tickets_select ON public.support_tickets
+  FOR SELECT TO authenticated
   USING (
     customer_id = public.current_profile_id()
     OR public.is_super_admin()
@@ -1017,10 +1133,50 @@ CREATE POLICY support_tickets_owner ON public.support_tickets
       WHERE pr.id = support_tickets.customer_id
         AND public.is_society_staff_of(pr.society_id)
     )
-  )
+  );
+
+DROP POLICY IF EXISTS support_tickets_customer_insert ON public.support_tickets;
+CREATE POLICY support_tickets_customer_insert ON public.support_tickets
+  FOR INSERT TO authenticated
   WITH CHECK (
     customer_id = public.current_profile_id()
-    OR public.is_super_admin()
+    AND status = 'open'
+    AND assigned_to IS NULL
+    AND resolution_notes IS NULL
+    AND is_demo = FALSE
+    AND (
+      parcel_id IS NULL
+      OR EXISTS (
+        SELECT 1 FROM public.parcels p
+        WHERE p.id = support_tickets.parcel_id
+          AND p.customer_id = public.current_profile_id()
+      )
+    )
+  );
+
+DROP POLICY IF EXISTS support_tickets_customer_update ON public.support_tickets;
+CREATE POLICY support_tickets_customer_update ON public.support_tickets
+  FOR UPDATE TO authenticated
+  USING (customer_id = public.current_profile_id())
+  WITH CHECK (
+    customer_id = public.current_profile_id()
+    AND assigned_to IS NULL
+    AND resolution_notes IS NULL
+  );
+
+DROP POLICY IF EXISTS support_tickets_admin_write ON public.support_tickets;
+CREATE POLICY support_tickets_admin_write ON public.support_tickets
+  FOR ALL TO authenticated
+  USING (
+    public.is_super_admin()
+    OR EXISTS (
+      SELECT 1 FROM public.profiles pr
+      WHERE pr.id = support_tickets.customer_id
+        AND public.is_society_staff_of(pr.society_id)
+    )
+  )
+  WITH CHECK (
+    public.is_super_admin()
     OR EXISTS (
       SELECT 1 FROM public.profiles pr
       WHERE pr.id = support_tickets.customer_id

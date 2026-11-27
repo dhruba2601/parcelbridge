@@ -224,9 +224,17 @@ describe('Security: Role Escalation, Tenant Isolation, IDOR, Notification & Driv
     expect(sql).toContain('REVOKE UPDATE ON public.notifications FROM authenticated;');
     expect(sql).toContain('GRANT UPDATE (is_read) ON public.notifications TO authenticated;');
 
-    // Driver assignment update policy & SECURITY INVOKER trigger
-    expect(sql).toContain('CREATE POLICY delivery_assignments_driver_update ON public.delivery_assignments');
-    expect(sql).toContain('CREATE OR REPLACE FUNCTION public.enforce_driver_assignment_update()');
+    // Driver assignment direct UPDATE is removed; drivers have read-only access and updates go through backend service_role
+    expect(sql).toContain('DROP POLICY IF EXISTS delivery_assignments_driver_update ON public.delivery_assignments;');
+    expect(sql).not.toContain('CREATE POLICY delivery_assignments_driver_update');
+
+    // Booking, return request, and support ticket customer update guards
+    expect(sql).toContain('CREATE OR REPLACE FUNCTION public.enforce_booking_customer_update()');
+    expect(sql).toContain('CREATE OR REPLACE FUNCTION public.enforce_return_request_customer_update()');
+    expect(sql).toContain('CREATE OR REPLACE FUNCTION public.enforce_support_ticket_customer_update()');
+    expect(sql).toContain('CREATE POLICY return_requests_customer_insert ON public.return_requests');
+    expect(sql).toContain('CREATE POLICY support_tickets_customer_insert ON public.support_tickets');
+    expect(sql).toContain('NEW.created_at IS DISTINCT FROM OLD.created_at');
 
     // Hub manager scoped to society via is_society_staff_of; only super_admin is global
     expect(sql).toContain('CREATE OR REPLACE FUNCTION public.is_super_admin()');
@@ -235,5 +243,26 @@ describe('Security: Role Escalation, Tenant Isolation, IDOR, Notification & Driv
 
     // Recursion helper preserved
     expect(sql).toContain('CREATE OR REPLACE FUNCTION public.is_driver_assigned_to_parcel(target_parcel_id UUID)');
+  });
+
+  it('requires valid OTP before Express backend updates delivery assignment or parcel status', async () => {
+    const delLogin = await request(app).post('/api/v1/auth/login').send({
+      email: 'delivery.demo@parcelbridge.io',
+      password: 'DemoPass@2026',
+    });
+    const delToken = delLogin.body.token;
+    const assignedParcelId = repo.memory.parcels[1].id;
+
+    // Missing or invalid OTP must fail and leave assignment & parcel status unchanged
+    const badConfirm = await request(app)
+      .post('/api/v1/delivery/confirm')
+      .set('Authorization', `Bearer ${delToken}`)
+      .send({ parcelId: assignedParcelId, otp: '999999' });
+    expect(badConfirm.status).toBe(400);
+
+    const parcelAfter = repo.memory.parcels.find((p) => p.id === assignedParcelId)!;
+    const assignAfter = repo.memory.assignments.find((a) => a.parcel_id === assignedParcelId)!;
+    expect(parcelAfter.current_status).not.toBe('Delivered');
+    expect(assignAfter.status).toBe('assigned');
   });
 });
